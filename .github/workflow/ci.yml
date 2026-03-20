@@ -1,0 +1,141 @@
+name: Build and Push Docker Image
+
+on:
+  release:
+    types: [published]
+
+# 使用并发取消任何当前作业或运行
+concurrency:
+  group: ${{github.ref}}
+  cancel-in-progress: true
+
+jobs:
+  action_trigger:
+    if: startsWith(github.ref, 'refs/tags/nexus-ai/')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+
+    steps:
+      - name: get tag info
+        uses: Seechange-edu/Parse-Action-Tag@main
+        with:
+          githubToken: ${{ secrets.ACTION_TOKEN }}
+          type: parse
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: SeeChange-edu/${{ env.REPOSITORY }}
+          token: ${{ secrets.ACTION_TOKEN }}
+          ref: ${{ env.BRANCH }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: yarn
+
+      - name: Build Yarn
+        run: |
+          yarn --frozen-lockfile
+          cp ./env/${{ env.PUSHREF }}.env .env.production
+          yarn build
+
+      - name: Setup AWS ECR Details (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-ECR-Push
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to AWS ECR
+        id: login-pf-aws-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and push frontend Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/dev:frontend-dev
+          build-args: BUILD_ENV=dev
+          cache-from: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/dev:buildcache
+          cache-to: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/dev:buildcache,mode=max
+          platforms: linux/amd64
+
+      - name: Get ECR login token
+        id: ecr-login-token
+        run: |
+          ECR_TOKEN=$(aws ecr get-login-password --region ${{ vars.AWS_REGION }})
+          echo "token<<EOF" >> $GITHUB_OUTPUT
+          echo "$ECR_TOKEN" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: SSH and Run Docker image
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ vars.REMOTE_HOST }}
+          username: ${{ vars.REMOTE_USER }}
+          key: ${{ secrets.REMOTE_SSH_KEY }}
+          envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ECR_TOKEN
+          script: |
+            # Login to AWS ECR using temporary token from GitHub Actions
+            echo ${ECR_TOKEN} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+            
+            IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}:${IMAGE_TAG}"
+            docker pull ${IMAGE_URI}
+            if [ "$(docker ps -a --format '{{.Names}}' | grep -c ${{ env.PREV_NAME }})" -gt 0 ]; then 
+              docker rm -f ${{ env.PREV_NAME }}
+            fi
+            if [ "$(docker ps -a --format '{{.Names}}' | grep -c ${{ env.NAME }})" -gt 0 ]; then 
+              docker rm -f ${{ env.NAME }}
+            fi
+            docker run --name ${{ env.NAME }} -d -p ${{ env.OUT_PORT }}:${{ env.PORT }} --restart unless-stopped ${IMAGE_URI}
+            docker image prune --force
+            docker container prune --force
+        env:
+          ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ env.IMAGE || 'latest' }}
+          ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
+
+  notify-teams:
+    if: always()
+    needs: [ action_trigger ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Teams Notification
+        env:
+          WEBHOOK: ${{ vars.TEAMS_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -X POST -H "Content-Type: application/json" \
+          -d '{
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "themeColor": "${{ needs.action_trigger.result == 'success' && '00FF00' || 'FF0000' }}",
+            "summary": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}",
+            "title": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}: ${{ github.repository }}: ${{ github.workflow }}",
+            "sections": [{
+              "facts": [
+                { "name": "Repository", "value": "${{ github.repository }}" },
+                { "name": "Triggered by", "value": "${{ github.event_name }}" },
+                { "name": "Commit Message", "value": "${{ github.event.head_commit.message }}" },
+                { "name": "Author", "value": "@${{ github.actor }}" },
+                { "name": "Result", "value": "${{ needs.action_trigger.result }}" }
+              ],
+              "text": "[View Workflow Run](${{ env.RUN_URL }})"
+            }]
+          }' \
+          "$WEBHOOK"
