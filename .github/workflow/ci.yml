@@ -68,10 +68,10 @@ jobs:
           context: ./frontend
           file: ./frontend/Dockerfile
           push: true
-          tags: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/dev:frontend-dev
-          build-args: BUILD_ENV=dev
-          cache-from: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/dev:buildcache
-          cache-to: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/dev:buildcache,mode=max
+          tags: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:${{ env.NAME }}
+          build-args: BUILD_ENV=${{ env.ACTIVE }}
+          cache-from: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:buildcache
+          cache-to: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:buildcache,mode=max
           platforms: linux/amd64
 
       - name: Get ECR login token
