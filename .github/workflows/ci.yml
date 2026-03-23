@@ -40,6 +40,7 @@ jobs:
           cache: yarn
 
       - name: Build Yarn
+        working-directory: ./frontend
         run: |
           yarn --frozen-lockfile
           cp ./env/${{ env.PUSHREF }}.env .env.production
