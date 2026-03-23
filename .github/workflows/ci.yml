@@ -35,6 +35,7 @@ jobs:
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
+        working-directory: ./frontend
         with:
           node-version: '20'
           cache: yarn
