@@ -96,7 +96,7 @@ jobs:
             echo "Starting frontend container..."
             docker run -d \
               --name nexus-ai-frontend-${{ env.ACTIVE }} \
-              -p 15173:80 \
+              -p ${{ env.OUT_PORT }}:${{ env.PORT }} \
               --restart unless-stopped \
               $IMAGE_URI
             
