@@ -33,24 +33,12 @@ jobs:
           driver-opts: |
             image=moby/buildkit:latest
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: yarn
-
-      - name: Build Yarn
-        run: |
-          yarn --frozen-lockfile
-          cp ./env/${{ env.PUSHREF }}.env .env.production
-          yarn build
-
       - name: Setup AWS ECR Details (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          role-session-name: GitHubActions-ECR-Push
-          aws-region: ${{ vars.AWS_REGION }}
+            role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+            role-session-name: GitHubActions-ECR-Push
+            aws-region: ${{ vars.AWS_REGION }}
 
       - name: Login to AWS ECR
         id: login-pf-aws-ecr
@@ -62,7 +50,7 @@ jobs:
           context: ./frontend
           file: ./frontend/Dockerfile
           push: true
-          tags: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:${{ env.NAME }}
+          tags: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:frontend-${{ env.ACTIVE }}
           build-args: BUILD_ENV=${{ env.ACTIVE }}
           cache-from: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:buildcache
           cache-to: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:buildcache,mode=max
@@ -76,33 +64,45 @@ jobs:
           echo "$ECR_TOKEN" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: SSH and Run Docker image
+      - name: SSH and deploy frontend
         uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_URI: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:frontend-${{ env.ACTIVE }}
+          ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
+          ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
         with:
-          host: ${{ vars.REMOTE_HOST }}
+          host: ${{ vars.DEV_REMOTE_HOST }}
           username: ${{ vars.REMOTE_USER }}
           key: ${{ secrets.REMOTE_SSH_KEY }}
-          envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ECR_TOKEN
+          envs: IMAGE_URI,ECR_TOKEN,ECR_REGISTRY
           script: |
             # Login to AWS ECR using temporary token from GitHub Actions
             echo ${ECR_TOKEN} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+            # Free disk space before pull (avoid "no space left on device")
+            if [ "$(docker ps -a -q -f name=nexus-ai-frontend-${{ env.ACTIVE }})" ]; then
+              echo "Stopping and removing existing nexus-ai-frontend-${{ env.ACTIVE }} container..."
+              docker stop nexus-ai-frontend-${{ env.ACTIVE }} || true
+              docker rm -f nexus-ai-frontend-${{ env.ACTIVE }} || true
+            fi
+            echo "Pruning unused Docker resources to free space..."
+            docker container prune -f || true
+            docker image prune -af || true
+            docker system prune -af --volumes || true
             
-            IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}:${IMAGE_TAG}"
-            docker pull ${IMAGE_URI}
-            if [ "$(docker ps -a --format '{{.Names}}' | grep -c ${{ env.PREV_NAME }})" -gt 0 ]; then 
-              docker rm -f ${{ env.PREV_NAME }}
-            fi
-            if [ "$(docker ps -a --format '{{.Names}}' | grep -c ${{ env.NAME }})" -gt 0 ]; then 
-              docker rm -f ${{ env.NAME }}
-            fi
-            docker run --name ${{ env.NAME }} -d -p ${{ env.OUT_PORT }}:${{ env.PORT }} --restart unless-stopped ${IMAGE_URI}
+            # Pull latest frontend image
+            docker pull $IMAGE_URI
+
+            echo "Starting frontend container..."
+            docker run -d \
+              --name nexus-ai-frontend-${{ env.ACTIVE }} \
+              -p 15173:80 \
+              --restart unless-stopped \
+              $IMAGE_URI
+            
+            # Clean up unused images
             docker image prune --force
             docker container prune --force
-        env:
-          ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ env.IMAGE || 'latest' }}
-          ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
 
   notify-teams:
     if: always()
