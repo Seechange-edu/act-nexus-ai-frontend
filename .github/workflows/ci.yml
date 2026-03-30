@@ -73,7 +73,7 @@ jobs:
         with:
           host: ${{ env.REMOTE_HOST }}
           username: ${{ vars.REMOTE_USER }}
-          key: ${{ env.REMOTE_SSH_KEY }}
+          key: ${{ secrets.REMOTE_SSH_KEY }}
           envs: IMAGE_URI,ECR_TOKEN,ECR_REGISTRY
           script: |
             # Login to AWS ECR using temporary token from GitHub Actions
