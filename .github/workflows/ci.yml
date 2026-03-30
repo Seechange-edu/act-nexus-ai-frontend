@@ -71,9 +71,9 @@ jobs:
           ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
           ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
         with:
-          host: ${{ vars.DEV_REMOTE_HOST }}
+          host: ${{ env.REMOTE_HOST }}
           username: ${{ vars.REMOTE_USER }}
-          key: ${{ secrets.REMOTE_SSH_KEY }}
+          key: ${{ env.REMOTE_SSH_KEY }}
           envs: IMAGE_URI,ECR_TOKEN,ECR_REGISTRY
           script: |
             # Login to AWS ECR using temporary token from GitHub Actions
