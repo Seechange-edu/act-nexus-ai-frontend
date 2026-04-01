@@ -56,6 +56,10 @@ jobs:
           cache-to: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:buildcache,mode=max
           platforms: linux/amd64
 
+      - name: Record image URI for deploy
+        run: |
+          echo "IMAGE_URI=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:frontend${{ env.BRANCH }}" >> $GITHUB_ENV
+
       - name: Get ECR login token
         id: ecr-login-token
         run: |
@@ -67,7 +71,7 @@ jobs:
       - name: SSH and deploy frontend
         uses: appleboy/ssh-action@v1.2.0
         env:
-          IMAGE_URI: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:frontend${{ env.BRANCH }}
+          IMAGE_URI: ${{ env.IMAGE_URI }}
           ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
           ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
         with:
