@@ -50,7 +50,7 @@ jobs:
           context: ./frontend
           file: ./frontend/Dockerfile
           push: true
-          tags: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:frontend-${{ env.ACTIVE }}
+          tags: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:${{ env.BRANCH }}
           build-args: BUILD_ENV=${{ env.ACTIVE }}
           cache-from: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:buildcache
           cache-to: type=registry,ref=${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:buildcache,mode=max
@@ -67,7 +67,7 @@ jobs:
       - name: SSH and deploy frontend
         uses: appleboy/ssh-action@v1.2.0
         env:
-          IMAGE_URI: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:frontend-${{ env.ACTIVE }}
+          IMAGE_URI: ${{ steps.login-pf-aws-ecr.outputs.registry }}/${{ vars.APP_ID }}/${{ env.ACTIVE }}:${{ env.BRANCH }}
           ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
           ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
         with:
