@@ -113,9 +113,15 @@ jobs:
     needs: [ action_trigger ]
     runs-on: ubuntu-latest
     steps:
+      - name: get tag info
+        uses: Seechange-edu/Parse-Action-Tag@main
+        with:
+          githubToken: ${{ secrets.ACTION_TOKEN }}
+          type: parse
+
       - name: Send Teams Notification
         env:
-          WEBHOOK: ${{ vars.DEV_TEAMS_WEBHOOK_URL }}
+          WEBHOOK: ${{ env.TEAMS_WEBHOOK }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           curl -X POST -H "Content-Type: application/json" \
