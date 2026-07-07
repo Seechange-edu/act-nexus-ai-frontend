@@ -44,6 +44,23 @@ jobs:
         id: login-pf-aws-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
+      # Real env files are not committed; fetch the active one from the remote host into
+      # frontend/env/ so the Dockerfile bakes it at build time (Vite inlines VITE_* at build).
+      - name: Fetch build env from remote host
+        env:
+          SSH_KEY: ${{ secrets.REMOTE_SSH_KEY }}
+          REMOTE_HOST: ${{ env.REMOTE_HOST }}
+          REMOTE_USER: ${{ vars.REMOTE_USER }}
+          ACTIVE: ${{ env.ACTIVE }}
+        run: |
+          # Load the deploy key into an in-memory ssh-agent — never written to disk.
+          eval "$(ssh-agent -s)"
+          printf '%s\n' "$SSH_KEY" | ssh-add - >/dev/null
+          mkdir -p frontend/env ~/.ssh
+          ssh-keyscan -H "$REMOTE_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          scp "${REMOTE_USER}@${REMOTE_HOST}:~/env.nexus-ai-frontend/${ACTIVE}.env" \
+            "frontend/env/${ACTIVE}.env"
+
       - name: Build and push frontend Docker image
         uses: docker/build-push-action@v5
         with:
