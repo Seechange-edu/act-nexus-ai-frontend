@@ -100,17 +100,13 @@ jobs:
             # Login to AWS ECR using temporary token from GitHub Actions
             echo ${ECR_TOKEN} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
 
-            # Free disk space before pull (avoid "no space left on device")
+            # Make way for the new container
             if [ "$(docker ps -a -q -f name=nexus-ai-frontend-${{ env.ACTIVE }})" ]; then
               echo "Stopping and removing existing nexus-ai-frontend-${{ env.ACTIVE }} container..."
               docker stop nexus-ai-frontend-${{ env.ACTIVE }} || true
               docker rm -f nexus-ai-frontend-${{ env.ACTIVE }} || true
             fi
-            echo "Pruning unused Docker resources to free space..."
-            docker container prune -f || true
-            docker image prune -af || true
-            docker system prune -af --volumes || true
-            
+
             # Pull latest frontend image
             docker pull $IMAGE_URI
 
