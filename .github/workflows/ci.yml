@@ -123,7 +123,9 @@ jobs:
             
             # Clean up unused images
             docker image prune --force
-            docker container prune --force
+            # Disabled: the old container is already removed by name above, and pruning here would delete
+            # a container that crashed on startup, taking its logs with it.
+            # docker container prune --force
 
   notify-teams:
     if: always()
