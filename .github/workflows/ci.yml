@@ -12,6 +12,20 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
+    # Exposed so prune-images / notify-teams can run as separate jobs without re-parsing the Release.
+    outputs:
+      remote_host: ${{ steps.deploy-vars.outputs.remote_host }}
+      teams_webhook: ${{ steps.deploy-vars.outputs.teams_webhook }}
+      active: ${{ steps.deploy-vars.outputs.active }}
+      image_tag: ${{ steps.deploy-vars.outputs.image_tag }}
+      ecr_repository: ${{ steps.deploy-vars.outputs.ecr_repository }}
+      ecr_registry: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+      source_repo: ${{ steps.relinfo.outputs.source_repo }}
+      commit_sha: ${{ steps.relinfo.outputs.commit_sha }}
+      commit_short: ${{ steps.relinfo.outputs.commit_short }}
+      commit_message: ${{ steps.relinfo.outputs.commit_message }}
+      commit_url: ${{ steps.relinfo.outputs.commit_url }}
+      release_notes: ${{ steps.relinfo.outputs.release_notes }}
 
     steps:
       - name: get tag info
@@ -20,12 +34,53 @@ jobs:
           githubToken: ${{ secrets.ACTION_TOKEN }}
           type: parse
 
+      # Runs before the build so notify-teams still has the webhook/tag when a later step fails.
+      - name: Export deploy vars
+        id: deploy-vars
+        run: |
+          {
+            echo "remote_host=${{ env.REMOTE_HOST }}"
+            echo "teams_webhook=${{ env.TEAMS_WEBHOOK }}"
+            echo "active=${{ env.ACTIVE }}"
+            echo "image_tag=frontend${{ env.BRANCH }}"
+            echo "ecr_repository=${{ vars.APP_ID }}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           repository: SeeChange-edu/${{ env.REPOSITORY }}
           token: ${{ secrets.ACTION_TOKEN }}
           ref: ${{ env.BRANCH }}
+
+      # Commit + release notes for the Teams card. Runs before the build so a failed build still notifies with context.
+      - name: Collect commit and release info
+        id: relinfo
+        env:
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
+          SRC_REPO: SeeChange-edu/${{ env.REPOSITORY }}
+          REF: ${{ env.BRANCH }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          SUBJECT=$(git log -1 --pretty=%s)
+          # Release notes exist only when BRANCH is a release tag (prod); empty for branch deploys (dev).
+          NOTES=$(gh release view "$REF" --repo "$SRC_REPO" --json body -q .body 2>/dev/null | head -c 1500 || true)
+          # Fallback text keeps the card's notes block non-empty (avoids relying on Adaptive Card isVisible).
+          if [ -z "$NOTES" ]; then NOTES="_(no release notes — branch deploy)_"; fi
+          D=$(openssl rand -hex 8)
+          {
+            echo "source_repo=$SRC_REPO"
+            echo "commit_sha=$SHA"
+            echo "commit_short=$SHORT"
+            echo "commit_url=${{ github.server_url }}/$SRC_REPO/commit/$SHA"
+            echo "commit_message<<$D"
+            echo "$SUBJECT"
+            echo "$D"
+            echo "release_notes<<$D"
+            echo "$NOTES"
+            echo "$D"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -116,45 +171,165 @@ jobs:
               -p ${{ env.OUT_PORT }}:${{ env.PORT }} \
               --restart unless-stopped \
               $IMAGE_URI
-            
+
             # Clean up unused images
             docker image prune --force
             # Disabled: the old container is already removed by name above, and pruning here would delete
             # a container that crashed on startup, taking its logs with it.
             # docker container prune --force
 
-  notify-teams:
-    if: always()
-    needs: [ action_trigger ]
+  # Housekeeping only: never fails the run.
+  # Component-scoped: frontend and backend push under the same ${APP_ID}/${ACTIVE} repo but with
+  # `frontend`/`backend` tag prefixes, so this must only touch `frontend*` tags.
+  prune-images:
+    needs: [action_trigger]
+    if: needs.action_trigger.result == 'success'
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
-      - name: get tag info
-        uses: Seechange-edu/Parse-Action-Tag@main
-        with:
-          githubToken: ${{ secrets.ACTION_TOKEN }}
-          type: parse
-
-      - name: Send Teams Notification
+      - name: Prune old semver Docker images
+        uses: appleboy/ssh-action@v1.2.0
         env:
-          WEBHOOK: ${{ env.TEAMS_WEBHOOK }}
+          ECR_REGISTRY: ${{ needs.action_trigger.outputs.ecr_registry }}
+          ECR_REPOSITORY: ${{ needs.action_trigger.outputs.ecr_repository }}
+          IMAGE_TAG: ${{ needs.action_trigger.outputs.image_tag }}
+          ACTIVE: ${{ needs.action_trigger.outputs.active }}
+          COMPONENT: frontend
+        with:
+          host: ${{ needs.action_trigger.outputs.remote_host }}
+          username: ${{ vars.REMOTE_USER }}
+          key: ${{ secrets.REMOTE_SSH_KEY }}
+          envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ACTIVE,COMPONENT
+          script: |
+            IMAGE_PREFIX="${ECR_REGISTRY}/${ECR_REPOSITORY}/${ACTIVE}"
+            CURRENT="${IMAGE_TAG}"   # e.g. frontendv1.0.0
+
+            # Only prune when the current tag is <component><semver>; branch deploys are left alone.
+            if ! echo "$CURRENT" | grep -qE "^${COMPONENT}[vV][0-9]+\.[0-9]+\.[0-9]+$"; then
+              echo "Skip prune: IMAGE_TAG '${CURRENT}' is not ${COMPONENT}+semver"
+              exit 0
+            fi
+
+            mapfile -t TAGS < <(
+              docker images --format '{{.Repository}}:{{.Tag}}' \
+                | grep "^${IMAGE_PREFIX}:" \
+                | sed "s|^${IMAGE_PREFIX}:||" \
+                | grep -E "^${COMPONENT}[vV][0-9]+\.[0-9]+\.[0-9]+$" \
+                | sort -V
+            )
+
+            PREV=$(printf '%s\n' "${TAGS[@]}" | sort -V | awk -v cur="$CURRENT" '
+              { a[++n]=$0 }
+              END { for(i=1;i<=n;i++) if(a[i]==cur && i>1) { print a[i-1]; exit } }')
+
+            if [ -n "$PREV" ]; then
+              echo "Keep: ${CURRENT}, ${PREV}"
+            else
+              echo "Keep: ${CURRENT} only (no previous version)"
+            fi
+
+            for tag in "${TAGS[@]}"; do
+              [ "$tag" = "$CURRENT" ] && continue
+              [ -n "$PREV" ] && [ "$tag" = "$PREV" ] && continue
+              echo "Removing ${IMAGE_PREFIX}:${tag}"
+              docker rmi "${IMAGE_PREFIX}:${tag}" 2>/dev/null || true
+            done
+
+  # Notification only: never fails the run.
+  # Targets the Teams "Workflows" webhook (Post to a channel when a webhook request is received),
+  # which renders the Adaptive Card in attachments[0].content as-is.
+  notify-teams:
+    needs: [action_trigger]
+    if: always() && needs.action_trigger.outputs.teams_webhook != ''
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Teams notification (Power Automate)
+        env:
+          WEBHOOK: ${{ needs.action_trigger.outputs.teams_webhook }}
+          STATUS: ${{ needs.action_trigger.result }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REPO: ${{ needs.action_trigger.outputs.source_repo }}
+          ENVIRONMENT: ${{ needs.action_trigger.outputs.active }}
+          TAG: ${{ needs.action_trigger.outputs.image_tag }}
+          COMMIT_SHA: ${{ needs.action_trigger.outputs.commit_sha }}
+          COMMIT_SHORT: ${{ needs.action_trigger.outputs.commit_short }}
+          COMMIT_MESSAGE: ${{ needs.action_trigger.outputs.commit_message }}
+          COMMIT_URL: ${{ needs.action_trigger.outputs.commit_url }}
+          RELEASE_NOTES: ${{ needs.action_trigger.outputs.release_notes }}
+          ACTOR: ${{ github.actor }}
+          EVENT: ${{ github.event_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          curl -X POST -H "Content-Type: application/json" \
-          -d '{
-            "@type": "MessageCard",
-            "@context": "http://schema.org/extensions",
-            "themeColor": "${{ needs.action_trigger.result == 'success' && '00FF00' || 'FF0000' }}",
-            "summary": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}",
-            "title": "${{ needs.action_trigger.result == 'success' && '🎉 Build succeeded!' || '❌ Build failed!' }}: ${{ github.repository }}: ${{ github.workflow }}",
-            "sections": [{
-              "facts": [
-                { "name": "Repository", "value": "${{ github.repository }}" },
-                { "name": "Triggered by", "value": "${{ github.event_name }}" },
-                { "name": "Commit Message", "value": "${{ github.event.head_commit.message }}" },
-                { "name": "Author", "value": "@${{ github.actor }}" },
-                { "name": "Result", "value": "${{ needs.action_trigger.result }}" }
-              ],
-              "text": "[View Workflow Run](${{ env.RUN_URL }})"
-            }]
-          }' \
-          "$WEBHOOK"
+          # jq builds the whole Adaptive Card so release notes / commit messages are escaped safely.
+          # The Teams Workflows webhook renders attachments[0].content verbatim.
+          jq -n \
+            --arg status "$STATUS" \
+            --arg source_repo "$SOURCE_REPO" \
+            --arg environment "$ENVIRONMENT" \
+            --arg tag "$TAG" \
+            --arg commit_short "$COMMIT_SHORT" \
+            --arg commit_message "$COMMIT_MESSAGE" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg release_notes "$RELEASE_NOTES" \
+            --arg actor "$ACTOR" \
+            --arg event "$EVENT" \
+            --arg run_url "$RUN_URL" \
+            '{
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                contentUrl: null,
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  msteams: { width: "Full" },
+                  body: [
+                    {
+                      type: "Container",
+                      style: (if $status == "success" then "good" else "attention" end),
+                      bleed: true,
+                      items: [
+                        {
+                          type: "TextBlock",
+                          text: (if $status == "success" then "✅ Deploy succeeded" else "❌ Deploy failed" end),
+                          weight: "Bolder",
+                          size: "Medium",
+                          wrap: true
+                        },
+                        {
+                          type: "TextBlock",
+                          text: ($source_repo + " → " + $environment),
+                          spacing: "None",
+                          isSubtle: true,
+                          wrap: true
+                        }
+                      ]
+                    },
+                    {
+                      type: "FactSet",
+                      facts: [
+                        { title: "Environment", value: $environment },
+                        { title: "Tag / Branch", value: $tag },
+                        { title: "Commit", value: ("[" + $commit_short + "](" + $commit_url + ")") },
+                        { title: "Commit message", value: $commit_message },
+                        { title: "Triggered by", value: ($actor + " (" + $event + ")") },
+                        { title: "Result", value: $status }
+                      ]
+                    },
+                    { type: "TextBlock", text: "**Release notes**", wrap: true, spacing: "Medium" },
+                    {
+                      type: "Container",
+                      style: "emphasis",
+                      items: [ { type: "TextBlock", text: $release_notes, wrap: true } ]
+                    }
+                  ],
+                  actions: [
+                    { type: "Action.OpenUrl", title: "View workflow run", url: $run_url },
+                    { type: "Action.OpenUrl", title: "View commit", url: $commit_url }
+                  ]
+                }
+              }]
+            }' \
+          | curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK"
