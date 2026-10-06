@@ -1,0 +1,129 @@
+name: User changelog
+
+run-name: User changelog · Nexus-AI ${{ inputs.tag }}
+
+# Writes (or rewrites) the user-facing notes of one Nexus-AI release by hand:
+# for a release that did not ask for them, one whose run failed, or to try the
+# changelog out. The automatic path is the `changelog` job in ci.yml; this is
+# the same repo-toolkit mode with the scope forced.
+#
+# 🔴 This repository is PUBLIC: its logs, job summaries and artifacts are
+# readable by anyone. `quiet` keeps the notes and error details out of them;
+# they land only in the source repository's (private) release. To read a run's
+# details, run the repo-toolkit CLI locally instead:
+#   repo-toolkit changelog --repo <checkout> --tag <tag> --scope single --dry-run
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag of Nexus-AI, e.g. v1.2.3'
+        required: true
+        type: string
+      previous:
+        description: 'Where the notes start (default: where they last reached)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC sign-in to AWS, for the SSM settings
+      contents: read
+    env:
+      TAG: ${{ inputs.tag }}
+      PREVIOUS: ${{ inputs.previous }}
+    steps:
+      # Free text going into a checkout ref: tag-shaped or nothing.
+      - name: Check the tags
+        run: |
+          for NAME in "$TAG" "$PREVIOUS"; do
+            [ -z "$NAME" ] || printf '%s' "$NAME" | grep -Eq '^[A-Za-z0-9._-]+$' || {
+              echo "::error::'${NAME}' is not a tag name."
+              exit 1
+            }
+          done
+
+      - name: Checkout the source repository with its history
+        uses: actions/checkout@v4
+        with:
+          repository: Seechange-edu/Nexus-AI
+          ref: ${{ env.TAG }}
+          token: ${{ secrets.ACTION_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # repo-toolkit is private, and a public repository cannot `uses:` a
+      # private action; checked out, it runs as a local one.
+      - name: Checkout repo-toolkit
+        uses: actions/checkout@v4
+        with:
+          repository: Seechange-edu/repo-toolkit
+          token: ${{ secrets.ACTION_TOKEN }}
+          path: .repo-toolkit
+          persist-credentials: false
+
+      - name: Sign in to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-Changelog
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # The SSM parameters Nexus-AI's backend already maps
+      # (ssm_secret_mapping.properties), plus the two changelog models.
+      # Every secret is masked before it is written anywhere: this log is public.
+      - name: Read the changelog settings from SSM
+        run: |
+          set -euo pipefail
+          param() {
+            aws ssm get-parameter --name "$1" --with-decryption \
+              --query Parameter.Value --output text 2>/dev/null || true
+          }
+          OPENAI_KEY=$(param /scale-ai/dev/OPENAI_API_KEY)
+          if [ -z "$OPENAI_KEY" ]; then
+            echo "::error::Could not read /scale-ai/dev/OPENAI_API_KEY from SSM."
+            exit 1
+          fi
+          echo "::add-mask::$OPENAI_KEY"
+          # api-meter: application by ingest key, service and feature set by
+          # repo-toolkit. Off the same way it is for the backends.
+          METER_URL=""
+          METER_KEYS=""
+          if [ "$(param /api-meter/prod/GLOBAL_ENABLED)" != false ]; then
+            METER_URL=$(param /api-meter/prod/PROXY_URL_PROD)
+            for PAIR in "scale-ai|INGEST_KEY_SCALE_AI"; do
+              IFS='|' read -r APP NAME <<< "$PAIR"
+              KEY=$(param "/api-meter/prod/${NAME}")
+              [ -n "$KEY" ] || continue
+              echo "::add-mask::$KEY"
+              METER_KEYS="${METER_KEYS}${APP}=${KEY},"
+            done
+          fi
+          {
+            echo "CHANGELOG_OPENAI_KEY=$OPENAI_KEY"
+            echo "CHANGELOG_MODEL=$(param /global/prod/CHANGELOG_MODEL_OPENAI)"
+            echo "CHANGELOG_SUMMARY_MODEL=$(param /global/prod/CHANGELOG_SUMMARY_MODEL_OPENAI)"
+            echo "CHANGELOG_METER_URL=$METER_URL"
+            echo "CHANGELOG_METER_KEYS=$METER_KEYS"
+          } >> "$GITHUB_ENV"
+
+      - name: Write the release notes
+        uses: ./.repo-toolkit
+        with:
+          mode: changelog
+          tag: ${{ env.TAG }}
+          scope: single
+          previous: ${{ env.PREVIOUS }}
+          openaiKey: ${{ env.CHANGELOG_OPENAI_KEY }}
+          model: ${{ env.CHANGELOG_MODEL }}
+          summaryModel: ${{ env.CHANGELOG_SUMMARY_MODEL }}
+          meterBaseUrl: ${{ env.CHANGELOG_METER_URL }}
+          meterKeys: ${{ env.CHANGELOG_METER_KEYS }}
+          quiet: 'true'
+          dryRun: 'false'
+          token: ${{ secrets.ACTION_TOKEN }}
