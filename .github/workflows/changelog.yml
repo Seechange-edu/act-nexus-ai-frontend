@@ -1,11 +1,16 @@
 name: User changelog
 
-run-name: User changelog · Nexus-AI ${{ inputs.tag }}
+run-name: User changelog · Nexus-AI ${{ github.event.client_payload.tag }} (${{ github.event.client_payload.scope }})
 
-# Writes (or rewrites) the user-facing notes of one Nexus-AI release by hand:
+# Writes (or rewrites) the user-facing notes of one Nexus-AI release on request:
 # for a release that did not ask for them, one whose run failed, or to try the
-# changelog out. The automatic path is the `changelog` job in ci.yml; this is
-# the same repo-toolkit mode with the scope forced.
+# changelog out. The automatic path is the `changelog` job after a deploy.
+#
+# Started only from Nexus-AI's own changelog.yml, which sends repository_dispatch
+# `changelog` {tag, scope, previous} here with ACTION_TOKEN: every action is
+# taken in the private source repository, and this one only runs it and shows
+# the result. The payload is read through env and checked before anything
+# uses it.
 #
 # 🔴 This repository is PUBLIC: its logs, job summaries and artifacts are
 # readable by anyone. `quiet` keeps the notes and error details out of them;
@@ -13,17 +18,8 @@ run-name: User changelog · Nexus-AI ${{ inputs.tag }}
 # details, run the repo-toolkit CLI locally instead:
 #   repo-toolkit changelog --repo <checkout> --tag <tag> --scope single --dry-run
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag of Nexus-AI, e.g. v1.2.3'
-        required: true
-        type: string
-      previous:
-        description: 'Where the notes start (default: where they last reached)'
-        required: false
-        type: string
-        default: ''
+  repository_dispatch:
+    types: [changelog]
 
 permissions:
   contents: read
@@ -35,11 +31,13 @@ jobs:
       id-token: write   # OIDC sign-in to AWS, for the SSM settings
       contents: read
     env:
-      TAG: ${{ inputs.tag }}
-      PREVIOUS: ${{ inputs.previous }}
+      TAG: ${{ github.event.client_payload.tag }}
+      SCOPE: ${{ github.event.client_payload.scope }}
+      PREVIOUS: ${{ github.event.client_payload.previous }}
     steps:
-      # Free text going into a checkout ref: tag-shaped or nothing.
-      - name: Check the tags
+      # Free text going into a checkout ref and the toolkit: tag-shaped, and a
+      # scope this repository can take, or nothing runs.
+      - name: Check the request
         run: |
           for NAME in "$TAG" "$PREVIOUS"; do
             [ -z "$NAME" ] || printf '%s' "$NAME" | grep -Eq '^[A-Za-z0-9._-]+$' || {
@@ -47,6 +45,11 @@ jobs:
               exit 1
             }
           done
+          [ -n "$TAG" ] || { echo "::error::The request names no tag."; exit 1; }
+          case "$SCOPE" in
+            single) ;;
+            *) echo "::error::Scope '${SCOPE}' is not one Nexus-AI can take (single)."; exit 1 ;;
+          esac
 
       - name: Checkout the source repository with its history
         uses: actions/checkout@v4
@@ -117,7 +120,7 @@ jobs:
         with:
           mode: changelog
           tag: ${{ env.TAG }}
-          scope: single
+          scope: ${{ env.SCOPE }}
           previous: ${{ env.PREVIOUS }}
           openaiKey: ${{ env.CHANGELOG_OPENAI_KEY }}
           model: ${{ env.CHANGELOG_MODEL }}
