@@ -180,6 +180,143 @@ jobs:
             # a container that crashed on startup, taking its logs with it.
             # docker container prune --force
 
+  # User-facing notes for a prod release that just deployed, written into
+  # the source repository's (private) release, below the GitHub notes. Only
+  # when that release asked for them (release-meta `changelog`); otherwise
+  # repo-toolkit reads it and stops in seconds. Never fails the run. The
+  # OpenAI key, models and api-meter settings come from AWS SSM.
+  #
+  # 🔴 This repository is PUBLIC: its logs, job summaries and artifacts are
+  # readable by anyone. `quiet` keeps the notes and error details out of
+  # them, and nothing in this job may echo the private source.
+  changelog:
+    needs: [action_trigger]
+    # Prod only: image_tag is `frontend` + the release tag (frontendv2.0.6)
+    # there, and `frontend` + a branch name elsewhere.
+    if: needs.action_trigger.result == 'success' && startsWith(needs.action_trigger.outputs.image_tag, 'frontendv')
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC sign-in to AWS, for the SSM settings
+      contents: read
+    steps:
+      # Nexus-AI ships frontend and backend from one release; this job runs
+      # here only, so each release is described once.
+      - name: Resolve the release tag
+        env:
+          IMAGE_TAG: ${{ needs.action_trigger.outputs.image_tag }}
+        run: |
+          TAG=${IMAGE_TAG#frontend}
+          printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9._-]+$' || {
+            echo "::error::'${TAG}' is not a tag name."
+            exit 1
+          }
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Checkout the source repository with its history
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.action_trigger.outputs.source_repo }}
+          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.ACTION_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # repo-toolkit is private, and a public repository cannot `uses:` a
+      # private action; checked out, it runs as a local one.
+      - name: Checkout repo-toolkit
+        uses: actions/checkout@v4
+        with:
+          repository: Seechange-edu/repo-toolkit
+          token: ${{ secrets.ACTION_TOKEN }}
+          path: .repo-toolkit
+          persist-credentials: false
+
+      - name: Sign in to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-Changelog
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # The SSM parameters Nexus-AI's backend already maps
+      # (ssm_secret_mapping.properties), plus the two changelog models.
+      # Every secret is masked before it is written anywhere: this log is public.
+      - name: Read the changelog settings from SSM
+        run: |
+          set -euo pipefail
+          param() {
+            aws ssm get-parameter --name "$1" --with-decryption \
+              --query Parameter.Value --output text 2>/dev/null || true
+          }
+          OPENAI_KEY=$(param /scale-ai/dev/OPENAI_API_KEY)
+          if [ -z "$OPENAI_KEY" ]; then
+            echo "::error::Could not read /scale-ai/dev/OPENAI_API_KEY from SSM."
+            exit 1
+          fi
+          echo "::add-mask::$OPENAI_KEY"
+          # api-meter: application by ingest key, service and feature set by
+          # repo-toolkit. Off the same way it is for the backends.
+          METER_URL=""
+          METER_KEYS=""
+          if [ "$(param /api-meter/prod/GLOBAL_ENABLED)" != false ]; then
+            METER_URL=$(param /api-meter/prod/PROXY_URL_PROD)
+            for PAIR in "scale-ai|INGEST_KEY_SCALE_AI"; do
+              IFS='|' read -r APP NAME <<< "$PAIR"
+              KEY=$(param "/api-meter/prod/${NAME}")
+              [ -n "$KEY" ] || continue
+              echo "::add-mask::$KEY"
+              METER_KEYS="${METER_KEYS}${APP}=${KEY},"
+            done
+          fi
+          {
+            echo "CHANGELOG_OPENAI_KEY=$OPENAI_KEY"
+            echo "CHANGELOG_MODEL=$(param /global/prod/CHANGELOG_MODEL_OPENAI)"
+            echo "CHANGELOG_SUMMARY_MODEL=$(param /global/prod/CHANGELOG_SUMMARY_MODEL_OPENAI)"
+            echo "CHANGELOG_METER_URL=$METER_URL"
+            echo "CHANGELOG_METER_KEYS=$METER_KEYS"
+          } >> "$GITHUB_ENV"
+
+      - name: Write the release notes
+        id: notes
+        uses: ./.repo-toolkit
+        with:
+          mode: changelog
+          tag: ${{ env.RELEASE_TAG }}
+          openaiKey: ${{ env.CHANGELOG_OPENAI_KEY }}
+          model: ${{ env.CHANGELOG_MODEL }}
+          summaryModel: ${{ env.CHANGELOG_SUMMARY_MODEL }}
+          meterBaseUrl: ${{ env.CHANGELOG_METER_URL }}
+          meterKeys: ${{ env.CHANGELOG_METER_KEYS }}
+          quiet: 'true'
+          dryRun: 'false'
+          token: ${{ secrets.ACTION_TOKEN }}
+
+      - name: Tell Teams the notes are ready for review
+        if: fromJSON(steps.notes.outputs.result).branches[0].reason == 'documented'
+        continue-on-error: true
+        env:
+          WEBHOOK: ${{ needs.action_trigger.outputs.teams_webhook }}
+          TAG: ${{ env.RELEASE_TAG }}
+          SOURCE_REPO: ${{ needs.action_trigger.outputs.source_repo }}
+          URL: ${{ fromJSON(steps.notes.outputs.result).branches[0].url }}
+        run: |
+          set -euo pipefail
+          [ -n "$WEBHOOK" ] || exit 0
+          jq -n \
+            --arg title "📝 ${TAG}: user changelog drafted" \
+            --arg subtitle "${SOURCE_REPO}" \
+            --arg next "AI draft, written below the GitHub notes. Review it before sharing it with users." \
+            --arg url "$URL" \
+            '{type: "message", attachments: [{contentType: "application/vnd.microsoft.card.adaptive", content: {
+              "$schema": "http://adaptivecards.io/schemas/adaptive-card.json", type: "AdaptiveCard", version: "1.4",
+              body: [{type: "TextBlock", size: "Medium", weight: "Bolder", wrap: true, text: $title},
+                     {type: "TextBlock", spacing: "None", isSubtle: true, wrap: true, text: $subtitle},
+                     {type: "TextBlock", spacing: "Medium", wrap: true, text: $next}],
+              actions: [{type: "Action.OpenUrl", title: "Open release", url: $url}]}}]}' \
+            | curl -fsS -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK" >/dev/null \
+            || echo "::warning::Could not post to Teams."
+
   # Housekeeping only: never fails the run.
   # Component-scoped: frontend and backend push under the same ${APP_ID}/${ACTIVE} repo but with
   # `frontend`/`backend` tag prefixes, so this must only touch `frontend*` tags.
