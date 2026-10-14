@@ -107,10 +107,26 @@ jobs:
               METER_KEYS="${METER_KEYS}${APP}=${KEY},"
             done
           fi
+          # The two models are not secrets, so say what was read, or why not: an
+          # unread one falls back to the default model, silently otherwise. Only
+          # the AWS error code is printed; the full message names the account
+          # and the role, and this log is public.
+          model() {
+            local out
+            if out=$(aws ssm get-parameter --name "$1" --with-decryption \
+                --query Parameter.Value --output text 2>&1); then
+              printf '%s' "$out"
+            else
+              echo "::warning::$1 was not read ($(printf '%s' "$out" | grep -oE '\([A-Za-z]+\)' | head -n1 | tr -d '()'))." >&2
+            fi
+          }
+          MODEL=$(model /global/prod/CHANGELOG_MODEL_OPENAI)
+          SUMMARY_MODEL=$(model /global/prod/CHANGELOG_SUMMARY_MODEL_OPENAI)
+          echo "Changelog models from SSM: read='${MODEL:-<not set: gpt-5.4-mini>}' merge='${SUMMARY_MODEL:-<not set: same as read>}'"
           {
             echo "CHANGELOG_OPENAI_KEY=$OPENAI_KEY"
-            echo "CHANGELOG_MODEL=$(param /global/prod/CHANGELOG_MODEL_OPENAI)"
-            echo "CHANGELOG_SUMMARY_MODEL=$(param /global/prod/CHANGELOG_SUMMARY_MODEL_OPENAI)"
+            echo "CHANGELOG_MODEL=$MODEL"
+            echo "CHANGELOG_SUMMARY_MODEL=$SUMMARY_MODEL"
             echo "CHANGELOG_METER_URL=$METER_URL"
             echo "CHANGELOG_METER_KEYS=$METER_KEYS"
           } >> "$GITHUB_ENV"
