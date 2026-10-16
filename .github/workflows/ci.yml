@@ -242,7 +242,13 @@ jobs:
       # The SSM parameters Nexus-AI's backend already maps
       # (ssm_secret_mapping.properties), plus the two changelog models.
       # Every secret is masked before it is written anywhere: this log is public.
+      # AWS_REGION is where the images go (ap-southeast-1); the parameters live
+      # with every other product's in ap-east-1, and the role's policy names
+      # them there, so this step reads from that region.
       - name: Read the changelog settings from SSM
+        env:
+          AWS_REGION: ap-east-1
+          AWS_DEFAULT_REGION: ap-east-1
         run: |
           set -euo pipefail
           # A parameter not read reads as empty, with a warning that gives only
@@ -319,7 +325,9 @@ jobs:
           token: ${{ secrets.ACTION_TOKEN }}
 
       - name: Tell Teams the notes are ready for review
-        if: fromJSON(steps.notes.outputs.result).branches[0].reason == 'documented'
+        # The notes step is skipped when the settings could not be read, and
+        # fromJSON of its empty output would fail the template, not just the step.
+        if: steps.notes.outcome == 'success' && fromJSON(steps.notes.outputs.result).branches[0].reason == 'documented'
         continue-on-error: true
         env:
           WEBHOOK: ${{ needs.action_trigger.outputs.teams_webhook }}
