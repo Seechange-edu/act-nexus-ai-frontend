@@ -325,15 +325,17 @@ jobs:
           token: ${{ secrets.ACTION_TOKEN }}
 
       - name: Tell Teams the notes are ready for review
-        # The notes step is skipped when the settings could not be read, and
-        # fromJSON of its empty output would fail the template, not just the step.
-        if: steps.notes.outcome == 'success' && fromJSON(steps.notes.outputs.result).branches[0].reason == 'documented'
+        # The notes step is skipped when the settings could not be read, and a
+        # step's env is expanded even when its `if` is false, so fromJSON of
+        # that empty output would fail the template, not just the step. Both
+        # read it through a fallback that is always valid JSON.
+        if: fromJSON(steps.notes.outputs.result || '{"branches":[{"url":"","reason":""}]}').branches[0].reason == 'documented'
         continue-on-error: true
         env:
           WEBHOOK: ${{ needs.action_trigger.outputs.teams_webhook }}
           TAG: ${{ env.RELEASE_TAG }}
           SOURCE_REPO: ${{ needs.action_trigger.outputs.source_repo }}
-          URL: ${{ fromJSON(steps.notes.outputs.result).branches[0].url }}
+          URL: ${{ fromJSON(steps.notes.outputs.result || '{"branches":[{"url":"","reason":""}]}').branches[0].url }}
         run: |
           set -euo pipefail
           [ -n "$WEBHOOK" ] || exit 0
