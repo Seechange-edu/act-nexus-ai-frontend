@@ -191,164 +191,67 @@ jobs:
   # them, and nothing in this job may echo the private source.
   changelog:
     needs: [action_trigger]
-    # Prod only: image_tag is `frontend` + the release tag (frontendv2.0.6)
-    # there, and `frontend` + a branch name elsewhere.
+    # Prod only: a release tag (v3.13.13, v3.12.2-a), not a branch deploy.
+    # The run itself is changelog-run.yml, shared with the manual
+    # changelog.yml; the release-meta decides the scope (no scope input).
     if: needs.action_trigger.result == 'success' && startsWith(needs.action_trigger.outputs.image_tag, 'frontendv')
-    continue-on-error: true
-    runs-on: ubuntu-latest
     permissions:
       id-token: write   # OIDC sign-in to AWS, for the SSM settings
       contents: read
+    uses: ./.github/workflows/changelog-run.yml
+    with:
+      source_repo: ${{ needs.action_trigger.outputs.source_repo }}
+      tag: ${{ needs.action_trigger.outputs.image_tag }}
+      # A `uses:` job cannot carry continue-on-error; the called job does.
+      soft_fail: true
+    secrets: inherit
+
+  changelog-notify:
+    needs: [action_trigger, changelog]
+    continue-on-error: true
+    runs-on: ubuntu-latest
     steps:
-      # Nexus-AI ships frontend and backend from one release; this job runs
-      # here only, so each release is described once.
-      - name: Resolve the release tag
-        env:
-          IMAGE_TAG: ${{ needs.action_trigger.outputs.image_tag }}
-        run: |
-          TAG=${IMAGE_TAG#frontend}
-          printf '%s' "$TAG" | grep -Eq '^[A-Za-z0-9._-]+$' || {
-            echo "::error::'${TAG}' is not a tag name."
-            exit 1
-          }
-          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
-
-      - name: Checkout the source repository with its history
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ needs.action_trigger.outputs.source_repo }}
-          ref: ${{ env.RELEASE_TAG }}
-          token: ${{ secrets.ACTION_TOKEN }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      # repo-toolkit is private, and a public repository cannot `uses:` a
-      # private action; checked out, it runs as a local one.
-      - name: Checkout repo-toolkit
-        uses: actions/checkout@v4
-        with:
-          repository: Seechange-edu/repo-toolkit
-          token: ${{ secrets.ACTION_TOKEN }}
-          path: .repo-toolkit
-          persist-credentials: false
-
-      - name: Sign in to AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          role-session-name: GitHubActions-Changelog
-          aws-region: ${{ vars.AWS_REGION }}
-
-      # The SSM parameters Nexus-AI's backend already maps
-      # (ssm_secret_mapping.properties), plus the two changelog models.
-      # Every secret is masked before it is written anywhere: this log is public.
-      # AWS_REGION is where the images go (ap-southeast-1); the parameters live
-      # with every other product's in ap-east-1, and the role's policy names
-      # them there, so this step reads from that region.
-      - name: Read the changelog settings from SSM
-        env:
-          AWS_REGION: ap-east-1
-          AWS_DEFAULT_REGION: ap-east-1
-        run: |
-          set -euo pipefail
-          # A parameter not read reads as empty, with a warning that gives only
-          # the AWS error code: the full message names the account and the
-          # role, and this log is public. Otherwise a role that cannot read the
-          # api-meter settings turns metering off without a word.
-          param() {
-            local out
-            if out=$(aws ssm get-parameter --name "$1" --with-decryption \
-                --query Parameter.Value --output text 2>&1); then
-              printf '%s' "$out"
-            else
-              echo "::warning::$1 was not read ($(printf '%s' "$out" | grep -oE '\([A-Za-z]+\)' | head -n1 | tr -d '()'))." >&2
-            fi
-          }
-          OPENAI_KEY=$(param /scale-ai/dev/OPENAI_API_KEY)
-          if [ -z "$OPENAI_KEY" ]; then
-            echo "::error::Could not read /scale-ai/dev/OPENAI_API_KEY from SSM."
-            exit 1
-          fi
-          echo "::add-mask::$OPENAI_KEY"
-          # api-meter: application by ingest key, service and feature set by
-          # repo-toolkit. Off the same way it is for the backends.
-          METER_URL=""
-          METER_KEYS=""
-          METER_APPS=""
-          METER_ENABLED=$(param /api-meter/prod/GLOBAL_ENABLED)
-          if [ "$METER_ENABLED" != false ]; then
-            METER_URL=$(param /api-meter/prod/PROXY_URL_PROD)
-            for PAIR in "scale-ai|INGEST_KEY_SCALE_AI"; do
-              IFS='|' read -r APP NAME <<< "$PAIR"
-              KEY=$(param "/api-meter/prod/${NAME}")
-              [ -n "$KEY" ] || continue
-              echo "::add-mask::$KEY"
-              METER_KEYS="${METER_KEYS}${APP}=${KEY},"
-              METER_APPS="${METER_APPS} ${APP}"
-            done
-          fi
-          # Say whether this run is metered: without a gateway URL every call
-          # goes straight to OpenAI and api-meter never sees it.
-          if [ "$METER_ENABLED" = false ]; then
-            echo "api-meter: off (GLOBAL_ENABLED=false), so the changelog calls are not metered."
-          elif [ -z "$METER_URL" ]; then
-            echo "::warning::api-meter: no gateway URL was read, so the changelog calls go straight to OpenAI and are not metered."
-          else
-            echo "api-meter: on, ingest keys for:${METER_APPS:- none}"
-          fi
-          # The two models are not secrets, so say what was read: an unread one
-          # falls back to the default model.
-          MODEL=$(param /global/prod/CHANGELOG_MODEL_OPENAI)
-          SUMMARY_MODEL=$(param /global/prod/CHANGELOG_SUMMARY_MODEL_OPENAI)
-          echo "Changelog models from SSM: read='${MODEL:-<not set: gpt-5.4-mini>}' merge='${SUMMARY_MODEL:-<not set: same as read>}'"
-          {
-            echo "CHANGELOG_OPENAI_KEY=$OPENAI_KEY"
-            echo "CHANGELOG_MODEL=$MODEL"
-            echo "CHANGELOG_SUMMARY_MODEL=$SUMMARY_MODEL"
-            echo "CHANGELOG_METER_URL=$METER_URL"
-            echo "CHANGELOG_METER_KEYS=$METER_KEYS"
-          } >> "$GITHUB_ENV"
-
-      - name: Write the release notes
-        id: notes
-        uses: ./.repo-toolkit
-        with:
-          mode: changelog
-          tag: ${{ env.RELEASE_TAG }}
-          openaiKey: ${{ env.CHANGELOG_OPENAI_KEY }}
-          model: ${{ env.CHANGELOG_MODEL }}
-          summaryModel: ${{ env.CHANGELOG_SUMMARY_MODEL }}
-          meterBaseUrl: ${{ env.CHANGELOG_METER_URL }}
-          meterKeys: ${{ env.CHANGELOG_METER_KEYS }}
-          quiet: 'true'
-          dryRun: 'false'
-          token: ${{ secrets.ACTION_TOKEN }}
-
       - name: Tell Teams the notes are ready for review
-        # The notes step is skipped when the settings could not be read, and a
-        # step's env is expanded even when its `if` is false, so fromJSON of
-        # that empty output would fail the template, not just the step. Both
-        # read it through a fallback that is always valid JSON.
-        if: fromJSON(steps.notes.outputs.result || '{"branches":[{"url":"","reason":""}]}').branches[0].reason == 'documented'
+        # The changelog job can fail before writing anything (its
+        # continue-on-error still runs this job), so its output is read
+        # through a fallback that is always valid JSON.
+        if: fromJSON(needs.changelog.outputs.result || '{"branches":[{"url":"","reason":""}]}').branches[0].reason == 'documented'
         continue-on-error: true
         env:
           WEBHOOK: ${{ needs.action_trigger.outputs.teams_webhook }}
-          TAG: ${{ env.RELEASE_TAG }}
+          TAG: ${{ fromJSON(needs.changelog.outputs.result || '{"branches":[{"tag":"","url":"","reason":""}]}').branches[0].tag }}
           SOURCE_REPO: ${{ needs.action_trigger.outputs.source_repo }}
-          URL: ${{ fromJSON(steps.notes.outputs.result || '{"branches":[{"url":"","reason":""}]}').branches[0].url }}
+          URL: ${{ fromJSON(needs.changelog.outputs.result || '{"branches":[{"url":"","reason":""}]}').branches[0].url }}
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
         run: |
           set -euo pipefail
           [ -n "$WEBHOOK" ] || exit 0
+          # The drafted notes for the card: our section of the release body,
+          # minus the collapsed blocks (short version, review notes) and the
+          # hidden comments, headings turned into bold (Teams has no #).
+          # Fetched with the token that wrote them, and sent only to Teams:
+          # this log is public and never prints them.
+          NOTES=$(gh api "repos/${SOURCE_REPO}/releases/tags/${TAG}" --jq .body \
+            | awk '/<!-- user-changelog:start -->/{on=1;next}
+                   /<!-- user-changelog:end -->/{on=0}
+                   on && /<details>/{skip=1}
+                   on && !skip && !/^<!--/{print}
+                   on && /<\/details>/{skip=0}' \
+            | sed -E 's/^#+ +(.*)$/**\1**/' \
+            | awk '{n+=length($0)+1; if(n>20000){print "...(truncated - open the release for the rest)"; exit}; print}' \
+            ) || NOTES=""
           jq -n \
             --arg title "📝 ${TAG}: user changelog drafted" \
             --arg subtitle "${SOURCE_REPO}" \
             --arg next "AI draft, written below the GitHub notes. Review it before sharing it with users." \
             --arg url "$URL" \
+            --arg notes "$NOTES" \
             '{type: "message", attachments: [{contentType: "application/vnd.microsoft.card.adaptive", content: {
               "$schema": "http://adaptivecards.io/schemas/adaptive-card.json", type: "AdaptiveCard", version: "1.4",
-              body: [{type: "TextBlock", size: "Medium", weight: "Bolder", wrap: true, text: $title},
-                     {type: "TextBlock", spacing: "None", isSubtle: true, wrap: true, text: $subtitle},
-                     {type: "TextBlock", spacing: "Medium", wrap: true, text: $next}],
+              body: ([{type: "TextBlock", size: "Medium", weight: "Bolder", wrap: true, text: $title},
+                      {type: "TextBlock", spacing: "None", isSubtle: true, wrap: true, text: $subtitle},
+                      {type: "TextBlock", spacing: "Medium", wrap: true, text: $next}]
+                     + (if $notes == "" then [] else [{type: "TextBlock", spacing: "Medium", separator: true, wrap: true, text: $notes}] end)),
               actions: [{type: "Action.OpenUrl", title: "Open release", url: $url}]}}]}' \
             | curl -fsS -X POST -H 'Content-Type: application/json' -d @- "$WEBHOOK" >/dev/null \
             || echo "::warning::Could not post to Teams."

@@ -1,0 +1,194 @@
+name: Changelog run
+
+# The job both changelog paths share: check out the source repository and
+# repo-toolkit, read the settings from SSM, write the notes into the release.
+# ci.yml calls it after a successful prod deploy (scope empty: the release-meta
+# decides); changelog.yml calls it on a request from the source repository
+# (scope forced). Only those two call it — it has no trigger of its own.
+#
+# 🔴 This repository is PUBLIC: its logs, job summaries and artifacts are
+# readable by anyone. `quiet` keeps the notes and error details out of them;
+# they land only in the source repository's (private) release.
+
+on:
+  workflow_call:
+    inputs:
+      source_repo:
+        description: 'owner/name of the private source repository'
+        required: true
+        type: string
+      tag:
+        description: 'The deployed release to write notes for'
+        required: true
+        type: string
+      scope:
+        description: 'single or joint, forcing a (re)write; empty: the release-meta decides'
+        required: false
+        type: string
+        default: ''
+      previous:
+        description: "Where this repository's notes start; empty: where they last reached"
+        required: false
+        type: string
+        default: ''
+      soft_fail:
+        description: "Carry on when the notes fail, so the caller's run stays green. A job that calls a workflow cannot carry continue-on-error itself, so the deploy path sets this instead; the manual path keeps failures red."
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      result:
+        description: "repo-toolkit's result JSON, for the caller's notifications"
+        value: ${{ jobs.changelog.outputs.result }}
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ inputs.soft_fail }}
+    permissions:
+      id-token: write   # OIDC sign-in to AWS, for the SSM settings
+      contents: read
+    outputs:
+      result: ${{ steps.notes.outputs.result }}
+    steps:
+      # Nexus-AI ships frontend and backend from one release, and the deploy
+      # hands this job `frontend` + the tag (frontendv2.0.9); a bare tag
+      # passes through unchanged, so the manual path needs no strip of its own.
+      - name: Resolve the release tag
+        env:
+          RAW_TAG: ${{ inputs.tag }}
+        run: |
+          TAG=${RAW_TAG#frontend}
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || {
+            echo "::error::'${TAG}' is not a tag name."
+            exit 1
+          }
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Checkout the source repository with its history
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ env.RELEASE_TAG }}
+          token: ${{ secrets.ACTION_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # repo-toolkit is private, and a public repository cannot `uses:` a
+      # private action; checked out, it runs as a local one.
+      - name: Checkout repo-toolkit
+        uses: actions/checkout@v4
+        with:
+          repository: Seechange-edu/repo-toolkit
+          token: ${{ secrets.ACTION_TOKEN }}
+          path: .repo-toolkit
+          persist-credentials: false
+
+      - name: Sign in to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-Changelog
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # The SSM parameters Nexus-AI's backend already maps
+      # (ssm_secret_mapping.properties), plus the two changelog models.
+      # Every secret is masked before it is written anywhere: this log is public.
+      # AWS_REGION is where the images go (ap-southeast-1); the parameters live
+      # with every other product's in ap-east-1, and the role's policy names
+      # them there, so this step reads from that region.
+      - name: Read the changelog settings from SSM
+        env:
+          AWS_REGION: ap-east-1
+          AWS_DEFAULT_REGION: ap-east-1
+        run: |
+          set -euo pipefail
+          # A parameter not read reads as empty, with a warning that gives only
+          # the AWS error code: the full message names the account and the
+          # role, and this log is public. Otherwise a role that cannot read the
+          # api-meter settings turns metering off without a word.
+          param() {
+            local out
+            if out=$(aws ssm get-parameter --name "$1" --with-decryption \
+                --query Parameter.Value --output text 2>&1); then
+              printf '%s' "$out"
+            else
+              echo "::warning::$1 was not read ($(printf '%s' "$out" | grep -oE '\([A-Za-z]+\)' | head -n1 | tr -d '()'))." >&2
+            fi
+          }
+          OPENAI_KEY=$(param /scale-ai/dev/OPENAI_API_KEY)
+          if [ -z "$OPENAI_KEY" ]; then
+            echo "::error::Could not read /scale-ai/dev/OPENAI_API_KEY from SSM."
+            exit 1
+          fi
+          echo "::add-mask::$OPENAI_KEY"
+          # api-meter: application by ingest key, service and feature set by
+          # repo-toolkit. Off the same way it is for the backends.
+          METER_URL=""
+          METER_KEYS=""
+          METER_APPS=""
+          METER_ENABLED=$(param /api-meter/prod/GLOBAL_ENABLED)
+          if [ "$METER_ENABLED" != false ]; then
+            METER_URL=$(param /api-meter/prod/PROXY_URL_PROD)
+            for PAIR in "scale-ai|INGEST_KEY_SCALE_AI"; do
+              IFS='|' read -r APP NAME <<< "$PAIR"
+              KEY=$(param "/api-meter/prod/${NAME}")
+              [ -n "$KEY" ] || continue
+              echo "::add-mask::$KEY"
+              METER_KEYS="${METER_KEYS}${APP}=${KEY},"
+              METER_APPS="${METER_APPS} ${APP}"
+            done
+          fi
+          # Say whether this run is metered: without a gateway URL every call
+          # goes straight to OpenAI and api-meter never sees it.
+          if [ "$METER_ENABLED" = false ]; then
+            echo "api-meter: off (GLOBAL_ENABLED=false), so the changelog calls are not metered."
+          elif [ -z "$METER_URL" ]; then
+            echo "::warning::api-meter: no gateway URL was read, so the changelog calls go straight to OpenAI and are not metered."
+          else
+            echo "api-meter: on, ingest keys for:${METER_APPS:- none}"
+          fi
+          # The two models are not secrets, so say what was read: an unread one
+          # falls back to the default model.
+          MODEL=$(param /global/prod/CHANGELOG_MODEL_OPENAI)
+          SUMMARY_MODEL=$(param /global/prod/CHANGELOG_SUMMARY_MODEL_OPENAI)
+          echo "Changelog models from SSM: read='${MODEL:-<not set: gpt-5.4-mini>}' merge='${SUMMARY_MODEL:-<not set: same as read>}'"
+          {
+            echo "CHANGELOG_OPENAI_KEY=$OPENAI_KEY"
+            echo "CHANGELOG_MODEL=$MODEL"
+            echo "CHANGELOG_SUMMARY_MODEL=$SUMMARY_MODEL"
+            echo "CHANGELOG_METER_URL=$METER_URL"
+            echo "CHANGELOG_METER_KEYS=$METER_KEYS"
+          } >> "$GITHUB_ENV"
+
+      - name: Write the release notes
+        id: notes
+        uses: ./.repo-toolkit
+        with:
+          mode: changelog
+          tag: ${{ env.RELEASE_TAG }}
+          scope: ${{ inputs.scope }}
+          previous: ${{ inputs.previous }}
+          openaiKey: ${{ env.CHANGELOG_OPENAI_KEY }}
+          model: ${{ env.CHANGELOG_MODEL }}
+          summaryModel: ${{ env.CHANGELOG_SUMMARY_MODEL }}
+          meterBaseUrl: ${{ env.CHANGELOG_METER_URL }}
+          meterKeys: ${{ env.CHANGELOG_METER_KEYS }}
+          quiet: 'true'
+          dryRun: 'false'
+          token: ${{ secrets.ACTION_TOKEN }}
+
+      # Where the notes went and how the run ended — nothing more: this
+      # summary is public, and the notes themselves stay in the (private)
+      # release, as `quiet` above keeps them out of the log and outputs.
+      - name: Write the run summary
+        env:
+          RESULT: ${{ steps.notes.outputs.result }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$RESULT" \
+            | jq -r '.branches[0] | "User changelog: [\(.tag)](\(.url)) — \(.reason)"' \
+            >> "$GITHUB_STEP_SUMMARY"

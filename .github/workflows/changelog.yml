@@ -14,7 +14,8 @@ run-name: User changelog · Nexus-AI ${{ github.event.client_payload.tag }} (${{
 #
 # 🔴 This repository is PUBLIC: its logs, job summaries and artifacts are
 # readable by anyone. `quiet` keeps the notes and error details out of them;
-# they land only in the source repository's (private) release. To read a run's
+# they land only in the source repository's (private) release (the run itself
+# is changelog-run.yml, shared with ci.yml's post-deploy job). To read a run's
 # details, run the repo-toolkit CLI locally instead:
 #   repo-toolkit changelog --repo <checkout> --tag <tag> --scope single --dry-run
 on:
@@ -25,22 +26,27 @@ permissions:
   contents: read
 
 jobs:
-  changelog:
+  # Free text from the payload is checked here and handed on as job outputs,
+  # so nothing unvalidated reaches a checkout ref.
+  check:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write   # OIDC sign-in to AWS, for the SSM settings
-      contents: read
     env:
       TAG: ${{ github.event.client_payload.tag }}
       SCOPE: ${{ github.event.client_payload.scope }}
       PREVIOUS: ${{ github.event.client_payload.previous }}
+    outputs:
+      tag: ${{ steps.ok.outputs.tag }}
+      scope: ${{ steps.ok.outputs.scope }}
+      previous: ${{ steps.ok.outputs.previous }}
     steps:
-      # Free text going into a checkout ref and the toolkit: tag-shaped, and a
-      # scope this repository can take, or nothing runs.
       - name: Check the request
+        id: ok
         run: |
+          # Bash's =~ checks the whole value as one string, where grep would
+          # pass a multi-line value on its one valid line — and a newline here
+          # would write extra lines into GITHUB_OUTPUT below.
           for NAME in "$TAG" "$PREVIOUS"; do
-            [ -z "$NAME" ] || printf '%s' "$NAME" | grep -Eq '^[A-Za-z0-9._-]+$' || {
+            [ -z "$NAME" ] || [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || {
               echo "::error::'${NAME}' is not a tag name."
               exit 1
             }
@@ -50,115 +56,21 @@ jobs:
             single) ;;
             *) echo "::error::Scope '${SCOPE}' is not one Nexus-AI can take (single)."; exit 1 ;;
           esac
-
-      - name: Checkout the source repository with its history
-        uses: actions/checkout@v4
-        with:
-          repository: Seechange-edu/Nexus-AI
-          ref: ${{ env.TAG }}
-          token: ${{ secrets.ACTION_TOKEN }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      # repo-toolkit is private, and a public repository cannot `uses:` a
-      # private action; checked out, it runs as a local one.
-      - name: Checkout repo-toolkit
-        uses: actions/checkout@v4
-        with:
-          repository: Seechange-edu/repo-toolkit
-          token: ${{ secrets.ACTION_TOKEN }}
-          path: .repo-toolkit
-          persist-credentials: false
-
-      - name: Sign in to AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          role-session-name: GitHubActions-Changelog
-          aws-region: ${{ vars.AWS_REGION }}
-
-      # The SSM parameters Nexus-AI's backend already maps
-      # (ssm_secret_mapping.properties), plus the two changelog models.
-      # Every secret is masked before it is written anywhere: this log is public.
-      # AWS_REGION is where the images go (ap-southeast-1); the parameters live
-      # with every other product's in ap-east-1, and the role's policy names
-      # them there, so this step reads from that region.
-      - name: Read the changelog settings from SSM
-        env:
-          AWS_REGION: ap-east-1
-          AWS_DEFAULT_REGION: ap-east-1
-        run: |
-          set -euo pipefail
-          # A parameter not read reads as empty, with a warning that gives only
-          # the AWS error code: the full message names the account and the
-          # role, and this log is public. Otherwise a role that cannot read the
-          # api-meter settings turns metering off without a word.
-          param() {
-            local out
-            if out=$(aws ssm get-parameter --name "$1" --with-decryption \
-                --query Parameter.Value --output text 2>&1); then
-              printf '%s' "$out"
-            else
-              echo "::warning::$1 was not read ($(printf '%s' "$out" | grep -oE '\([A-Za-z]+\)' | head -n1 | tr -d '()'))." >&2
-            fi
-          }
-          OPENAI_KEY=$(param /scale-ai/dev/OPENAI_API_KEY)
-          if [ -z "$OPENAI_KEY" ]; then
-            echo "::error::Could not read /scale-ai/dev/OPENAI_API_KEY from SSM."
-            exit 1
-          fi
-          echo "::add-mask::$OPENAI_KEY"
-          # api-meter: application by ingest key, service and feature set by
-          # repo-toolkit. Off the same way it is for the backends.
-          METER_URL=""
-          METER_KEYS=""
-          METER_APPS=""
-          METER_ENABLED=$(param /api-meter/prod/GLOBAL_ENABLED)
-          if [ "$METER_ENABLED" != false ]; then
-            METER_URL=$(param /api-meter/prod/PROXY_URL_PROD)
-            for PAIR in "scale-ai|INGEST_KEY_SCALE_AI"; do
-              IFS='|' read -r APP NAME <<< "$PAIR"
-              KEY=$(param "/api-meter/prod/${NAME}")
-              [ -n "$KEY" ] || continue
-              echo "::add-mask::$KEY"
-              METER_KEYS="${METER_KEYS}${APP}=${KEY},"
-              METER_APPS="${METER_APPS} ${APP}"
-            done
-          fi
-          # Say whether this run is metered: without a gateway URL every call
-          # goes straight to OpenAI and api-meter never sees it.
-          if [ "$METER_ENABLED" = false ]; then
-            echo "api-meter: off (GLOBAL_ENABLED=false), so the changelog calls are not metered."
-          elif [ -z "$METER_URL" ]; then
-            echo "::warning::api-meter: no gateway URL was read, so the changelog calls go straight to OpenAI and are not metered."
-          else
-            echo "api-meter: on, ingest keys for:${METER_APPS:- none}"
-          fi
-          # The two models are not secrets, so say what was read: an unread one
-          # falls back to the default model.
-          MODEL=$(param /global/prod/CHANGELOG_MODEL_OPENAI)
-          SUMMARY_MODEL=$(param /global/prod/CHANGELOG_SUMMARY_MODEL_OPENAI)
-          echo "Changelog models from SSM: read='${MODEL:-<not set: gpt-5.4-mini>}' merge='${SUMMARY_MODEL:-<not set: same as read>}'"
           {
-            echo "CHANGELOG_OPENAI_KEY=$OPENAI_KEY"
-            echo "CHANGELOG_MODEL=$MODEL"
-            echo "CHANGELOG_SUMMARY_MODEL=$SUMMARY_MODEL"
-            echo "CHANGELOG_METER_URL=$METER_URL"
-            echo "CHANGELOG_METER_KEYS=$METER_KEYS"
-          } >> "$GITHUB_ENV"
+            echo "tag=$TAG"
+            echo "scope=$SCOPE"
+            echo "previous=$PREVIOUS"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Write the release notes
-        uses: ./.repo-toolkit
-        with:
-          mode: changelog
-          tag: ${{ env.TAG }}
-          scope: ${{ env.SCOPE }}
-          previous: ${{ env.PREVIOUS }}
-          openaiKey: ${{ env.CHANGELOG_OPENAI_KEY }}
-          model: ${{ env.CHANGELOG_MODEL }}
-          summaryModel: ${{ env.CHANGELOG_SUMMARY_MODEL }}
-          meterBaseUrl: ${{ env.CHANGELOG_METER_URL }}
-          meterKeys: ${{ env.CHANGELOG_METER_KEYS }}
-          quiet: 'true'
-          dryRun: 'false'
-          token: ${{ secrets.ACTION_TOKEN }}
+  changelog:
+    needs: check
+    permissions:
+      id-token: write   # OIDC sign-in to AWS, for the SSM settings
+      contents: read
+    uses: ./.github/workflows/changelog-run.yml
+    with:
+      source_repo: Seechange-edu/Nexus-AI
+      tag: ${{ needs.check.outputs.tag }}
+      scope: ${{ needs.check.outputs.scope }}
+      previous: ${{ needs.check.outputs.previous }}
+    secrets: inherit
