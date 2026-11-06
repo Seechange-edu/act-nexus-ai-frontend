@@ -180,11 +180,15 @@ jobs:
           else
             echo "api-meter: on, ingest keys for:${METER_APPS:- none}"
           fi
-          # The two models are not secrets, so say what was read: an unread one
-          # falls back to the default model.
+          # Summary model takes precedence over the configured base model.
+          # Date-range summaries have no built-in model if both settings are absent.
           MODEL=$(param /global/prod/CHANGELOG_MODEL_OPENAI)
           SUMMARY_MODEL=$(param /global/prod/CHANGELOG_SUMMARY_MODEL_OPENAI)
-          echo "Changelog models from SSM: read='${MODEL:-<not set: gpt-5.4-mini>}' merge='${SUMMARY_MODEL:-<not set: same as read>}'"
+          if [ "$MODE" = changelog-summary ]; then
+            echo "Changelog summary model from SSM: '${SUMMARY_MODEL:-${MODEL:-<not set: required when there are entries>}}'"
+          else
+            echo "Changelog models from SSM: read='${MODEL:-<not set: gpt-5.4-mini>}' merge='${SUMMARY_MODEL:-<not set: same as read>}'"
+          fi
           {
             echo "CHANGELOG_OPENAI_KEY=$OPENAI_KEY"
             echo "CHANGELOG_MODEL=$MODEL"
