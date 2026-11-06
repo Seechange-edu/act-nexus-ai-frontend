@@ -13,14 +13,35 @@ name: Changelog run
 on:
   workflow_call:
     inputs:
+      mode:
+        description: 'changelog or changelog-summary'
+        required: false
+        type: string
+        default: changelog
       source_repo:
         description: 'owner/name of the private source repository'
         required: true
         type: string
       tag:
         description: 'The deployed release to write notes for'
-        required: true
+        required: false
         type: string
+        default: ''
+      start_date:
+        description: 'Summary first date, YYYY-MM-DD (UTC+8)'
+        required: false
+        type: string
+        default: ''
+      end_date:
+        description: 'Summary last date, inclusive (UTC+8)'
+        required: false
+        type: string
+        default: ''
+      output_tag:
+        description: 'Summary asset destination; empty means last release in range'
+        required: false
+        type: string
+        default: ''
       scope:
         description: 'single or joint, forcing a (re)write; empty: the release-meta decides'
         required: false
@@ -59,8 +80,14 @@ jobs:
       # passes through unchanged, so the manual path needs no strip of its own.
       - name: Resolve the release tag
         env:
+          MODE: ${{ inputs.mode }}
           RAW_TAG: ${{ inputs.tag }}
         run: |
+          case "$MODE" in
+            changelog-summary) echo 'RELEASE_TAG=' >> "$GITHUB_ENV"; exit 0 ;;
+            changelog) ;;
+            *) echo '::error::Unsupported changelog mode.'; exit 1 ;;
+          esac
           TAG=${RAW_TAG#frontend}
           [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || {
             echo "::error::'${TAG}' is not a tag name."
@@ -74,7 +101,7 @@ jobs:
           repository: ${{ inputs.source_repo }}
           ref: ${{ env.RELEASE_TAG }}
           token: ${{ secrets.ACTION_TOKEN }}
-          fetch-depth: 0
+          fetch-depth: ${{ inputs.mode == 'changelog-summary' && '1' || '0' }}
           persist-credentials: false
 
       # repo-toolkit is private, and a public repository cannot `uses:` a
@@ -83,6 +110,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Seechange-edu/repo-toolkit
+          ref: main
           token: ${{ secrets.ACTION_TOKEN }}
           path: .repo-toolkit
           persist-credentials: false
@@ -102,6 +130,7 @@ jobs:
       # them there, so this step reads from that region.
       - name: Read the changelog settings from SSM
         env:
+          MODE: ${{ inputs.mode }}
           AWS_REGION: ap-east-1
           AWS_DEFAULT_REGION: ap-east-1
         run: |
@@ -120,11 +149,11 @@ jobs:
             fi
           }
           OPENAI_KEY=$(param /scale-ai/dev/OPENAI_API_KEY)
-          if [ -z "$OPENAI_KEY" ]; then
+          if [ -z "$OPENAI_KEY" ] && [ "$MODE" = changelog ]; then
             echo "::error::Could not read /scale-ai/dev/OPENAI_API_KEY from SSM."
             exit 1
           fi
-          echo "::add-mask::$OPENAI_KEY"
+          [ -z "$OPENAI_KEY" ] || echo "::add-mask::$OPENAI_KEY"
           # api-meter: application by ingest key, service and feature set by
           # repo-toolkit. Off the same way it is for the backends.
           METER_URL=""
@@ -162,16 +191,20 @@ jobs:
             echo "CHANGELOG_SUMMARY_MODEL=$SUMMARY_MODEL"
             echo "CHANGELOG_METER_URL=$METER_URL"
             echo "CHANGELOG_METER_KEYS=$METER_KEYS"
+            echo "CHANGELOG_TOOLKIT_SHA=$(git -C .repo-toolkit rev-parse HEAD)"
           } >> "$GITHUB_ENV"
 
       - name: Write the release notes
         id: notes
         uses: ./.repo-toolkit
         with:
-          mode: changelog
+          mode: ${{ inputs.mode }}
           tag: ${{ env.RELEASE_TAG }}
           scope: ${{ inputs.scope }}
           previous: ${{ inputs.previous }}
+          startDate: ${{ inputs.start_date }}
+          endDate: ${{ inputs.end_date }}
+          outputTag: ${{ inputs.output_tag }}
           openaiKey: ${{ env.CHANGELOG_OPENAI_KEY }}
           model: ${{ env.CHANGELOG_MODEL }}
           summaryModel: ${{ env.CHANGELOG_SUMMARY_MODEL }}

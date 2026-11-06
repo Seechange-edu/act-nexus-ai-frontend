@@ -1,0 +1,64 @@
+name: User changelog summary
+
+run-name: User changelog summary · ${{ github.event.client_payload.start_date }} to ${{ github.event.client_payload.end_date }}
+
+# Public executor: never upload report artifacts or print their contents here.
+# All report files go to Nexus-AI's private release assets with quiet enabled.
+on:
+  repository_dispatch:
+    types: [changelog-summary]
+
+permissions:
+  contents: read
+
+# Serialize the same date range so fixed report names cannot race.
+concurrency:
+  group: changelog-summary-${{ github.event.client_payload.start_date }}-${{ github.event.client_payload.end_date }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      start_date: ${{ steps.ok.outputs.start_date }}
+      end_date: ${{ steps.ok.outputs.end_date }}
+      output_tag: ${{ steps.ok.outputs.output_tag }}
+    steps:
+      - name: Check the request
+        id: ok
+        env:
+          START_DATE: ${{ github.event.client_payload.start_date }}
+          END_DATE: ${{ github.event.client_payload.end_date }}
+          OUTPUT_TAG: ${{ github.event.client_payload.output_tag }}
+        run: |
+          set -euo pipefail
+          for VALUE in "$START_DATE" "$END_DATE"; do
+            [[ "$VALUE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || {
+              echo '::error::Expected YYYY-MM-DD dates.'; exit 1;
+            }
+          done
+          [[ "$START_DATE" < "$END_DATE" || "$START_DATE" = "$END_DATE" ]] || {
+            echo '::error::Start date must not be after end date.'; exit 1;
+          }
+          [[ -z "$OUTPUT_TAG" || "$OUTPUT_TAG" =~ ^[A-Za-z0-9._-]+$ ]] || {
+            echo '::error::Invalid output tag.'; exit 1;
+          }
+          {
+            echo "start_date=$START_DATE"
+            echo "end_date=$END_DATE"
+            echo "output_tag=$OUTPUT_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  summary:
+    needs: check
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/changelog-run.yml
+    with:
+      mode: changelog-summary
+      source_repo: Seechange-edu/Nexus-AI
+      start_date: ${{ needs.check.outputs.start_date }}
+      end_date: ${{ needs.check.outputs.end_date }}
+      output_tag: ${{ needs.check.outputs.output_tag }}
+    secrets: inherit
