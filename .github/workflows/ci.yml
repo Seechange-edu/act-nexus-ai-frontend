@@ -154,6 +154,7 @@ jobs:
           script: |
             # Login to AWS ECR using temporary token from GitHub Actions
             echo ${ECR_TOKEN} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+            docker pull "$IMAGE_URI" || exit 1
 
             # Make way for the new container
             if [ "$(docker ps -a -q -f name=nexus-ai-frontend-${{ env.ACTIVE }})" ]; then
@@ -161,9 +162,6 @@ jobs:
               docker stop nexus-ai-frontend-${{ env.ACTIVE }} || true
               docker rm -f nexus-ai-frontend-${{ env.ACTIVE }} || true
             fi
-
-            # Pull latest frontend image
-            docker pull $IMAGE_URI
 
             echo "Starting frontend container..."
             docker run -d \
