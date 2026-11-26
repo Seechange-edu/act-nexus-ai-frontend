@@ -301,13 +301,21 @@ jobs:
               exit 0
             fi
 
+            if ! LOCAL_IMAGES=$(docker images --format '{{.Repository}} {{.Tag}}'); then
+              echo "Skip version prune: could not list local Docker images" >&2
+              exit 0
+            fi
+
             mapfile -t TAGS < <(
-              docker images --format '{{.Repository}}:{{.Tag}}' \
-                | grep "^${IMAGE_PREFIX}:" \
-                | sed "s|^${IMAGE_PREFIX}:||" \
+              awk -v repo="$IMAGE_PREFIX" '$1 == repo { print $2 }' <<< "$LOCAL_IMAGES" \
                 | grep -E "^${COMPONENT}[vV][0-9]+\.[0-9]+\.[0-9]+$" \
                 | sort -V
             )
+
+            if ! grep -Fxq -- "$CURRENT" <<< "$(printf '%s\n' "${TAGS[@]}")"; then
+              echo "Skip version prune: ${IMAGE_PREFIX}:${CURRENT} is not in the local version list"
+              exit 0
+            fi
 
             PREV=$(printf '%s\n' "${TAGS[@]}" | sort -V | awk -v cur="$CURRENT" '
               { a[++n]=$0 }
